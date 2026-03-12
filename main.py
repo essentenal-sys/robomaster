@@ -46,8 +46,8 @@ from telegram.ext import (
 # ══════════════════════════════════════════════════════════
 #  ⚙️  НАСТРОЙКИ
 # ══════════════════════════════════════════════════════════
-TOKEN      = "8415981032:AAF-oOBHewyEX6cauyja7TzJLW1Y9M9sB9U"
-MANAGER_ID = 646956185
+TOKEN      = os.getenv("TOKEN", "8415981032:AAF-oOBHewyEX6cauyja7TzJLW1Y9M9sB9U")
+MANAGER_ID = int(os.getenv("MANAGER_ID", "646956185"))
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
