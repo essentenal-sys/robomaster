@@ -15,6 +15,8 @@ robomaster.su | +7 (495) 139-30-30
 
 import logging
 import os
+import sqlite3
+from datetime import datetime
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -54,6 +56,155 @@ ST_SEARCH    = "wait_search"
 ST_CALC_PALL = "calc_pallets"
 ST_CALC_WAGE = "calc_wage"
 ST_CALC_FILM = "calc_film"
+ST_BROADCAST = "wait_broadcast"   # рассылка
+
+# ══════════════════════════════════════════════════════════
+#  🗄️  БАЗА ДАННЫХ (SQLite)
+# ══════════════════════════════════════════════════════════
+DB_PATH = "robomaster.db"
+
+def db_init():
+    """Создаём таблицы при первом запуске."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            first_name TEXT,
+            joined_at  TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            event_type TEXT,   -- 'start','catalog','services','search','calc','request','lead'
+            detail     TEXT,   -- доп. инфо (раздел, модель, тема заявки)
+            created_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            username   TEXT,
+            name       TEXT,
+            phone      TEXT,
+            subject    TEXT,
+            comment    TEXT,
+            created_at TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+def db_register_user(user):
+    """Регистрируем пользователя если ещё нет."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at)
+        VALUES (?, ?, ?, ?)
+    """, (user.id, user.username or "", user.first_name or "", datetime.now().isoformat()))
+    con.commit()
+    con.close()
+
+def db_track(user_id: int, event_type: str, detail: str = ""):
+    """Записываем событие."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO events (user_id, event_type, detail, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, event_type, detail, datetime.now().isoformat()))
+    con.commit()
+    con.close()
+
+def db_save_lead(user, name: str, phone: str, subject: str, comment: str):
+    """Сохраняем заявку."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO leads (user_id, username, name, phone, subject, comment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user.id, user.username or "", name, phone, subject, comment, datetime.now().isoformat()))
+    con.commit()
+    con.close()
+
+def db_get_stats() -> str:
+    """Возвращает текст со статистикой."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    new_today = cur.execute(
+        "SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)
+    ).fetchone()[0]
+
+    total_leads = cur.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    leads_today = cur.execute(
+        "SELECT COUNT(*) FROM leads WHERE created_at LIKE ?", (f"{today}%",)
+    ).fetchone()[0]
+
+    # Топ разделов
+    top_sections = cur.execute("""
+        SELECT detail, COUNT(*) as cnt
+        FROM events
+        WHERE event_type IN ('catalog','services','search','calc')
+        GROUP BY detail ORDER BY cnt DESC LIMIT 5
+    """).fetchall()
+
+    # Топ моделей из поиска
+    top_search = cur.execute("""
+        SELECT detail, COUNT(*) as cnt
+        FROM events WHERE event_type = 'search'
+        GROUP BY detail ORDER BY cnt DESC LIMIT 5
+    """).fetchall()
+
+    # Последние 5 заявок
+    last_leads = cur.execute("""
+        SELECT name, phone, subject, created_at FROM leads
+        ORDER BY id DESC LIMIT 5
+    """).fetchall()
+
+    con.close()
+
+    text = (
+        "📈 *СТАТИСТИКА БОТА*\n\n"
+        f"👥 Всего пользователей: *{total_users}*\n"
+        f"🆕 Новых сегодня: *{new_today}*\n\n"
+        f"📋 Всего заявок: *{total_leads}*\n"
+        f"📋 Заявок сегодня: *{leads_today}*\n"
+    )
+
+    if top_sections:
+        text += "\n🔥 *Популярные разделы:*\n"
+        for detail, cnt in top_sections:
+            text += f"▸ {detail}: {cnt}\n"
+
+    if top_search:
+        text += "\n🔍 *Популярные запросы поиска:*\n"
+        for detail, cnt in top_search:
+            text += f"▸ {detail}: {cnt}\n"
+
+    if last_leads:
+        text += "\n📩 *Последние заявки:*\n"
+        for name, phone, subject, created_at in last_leads:
+            date = created_at[:10]
+            text += f"▸ {name} | {phone} | {subject} | {date}\n"
+
+    return text
+
+def db_get_all_user_ids() -> list:
+    """Все user_id для рассылки."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    ids = [row[0] for row in cur.execute("SELECT user_id FROM users").fetchall()]
+    con.close()
+    return ids
 
 # ══════════════════════════════════════════════════════════
 #  ⌨️  КНОПКИ
@@ -742,7 +893,10 @@ def search_products(query: str) -> list:
 # ══════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
-    name = update.effective_user.first_name or "друг"
+    user = update.effective_user
+    db_register_user(user)
+    db_track(user.id, "start")
+    name = user.first_name or "друг"
     await update.message.reply_text(
         f"👋 Добро пожаловать, *{name}*!\n\n"
         "🏭 *Робомастер* — официальный партнёр *Robopac / Aetna Group*.\n"
@@ -759,11 +913,42 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text  = update.message.text
     state = context.user_data.get("state", ST_IDLE)
+    user  = update.effective_user
+    db_register_user(user)
 
     # Отмена
     if text == BTN_CANCEL:
         context.user_data.clear()
         await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KB)
+        return
+
+    # Рассылка — ввод текста сообщения
+    if state == ST_BROADCAST:
+        if user.id != MANAGER_ID:
+            context.user_data.clear()
+            return
+        context.user_data.pop("state", None)
+        user_ids = db_get_all_user_ids()
+        sent = 0
+        failed = 0
+        await update.message.reply_text(
+            f"📤 Начинаю рассылку на *{len(user_ids)}* пользователей...",
+            parse_mode="Markdown", reply_markup=MAIN_KB)
+        for uid in user_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode="Markdown",
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+        await update.message.reply_text(
+            f"✅ *Рассылка завершена!*\n\n"
+            f"📨 Отправлено: *{sent}*\n"
+            f"❌ Не доставлено: *{failed}*",
+            parse_mode="Markdown", reply_markup=MAIN_KB)
         return
 
     # Диалог заявки
@@ -790,6 +975,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Поиск
     if state == ST_SEARCH:
         context.user_data.pop("state", None)
+        db_track(user.id, "search", text)
         results = search_products(text)
         if not results:
             await update.message.reply_text(
@@ -853,10 +1039,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Главное меню
     if text == BTN_CATALOG:
+        db_track(user.id, "catalog", "Каталог")
         await update.message.reply_text(
             "📦 *Каталог оборудования Robopac / Aetna Group*\n\nВыберите раздел:",
             parse_mode="Markdown", reply_markup=CAT_MAIN_KB)
     elif text == BTN_SERVICES:
+        db_track(user.id, "services", "Сервис")
         await update.message.reply_text(
             "🔧 *Сервис и техническая поддержка*\n\n_Не дадим остановиться вашему бизнесу!_\n\nВыберите услугу:",
             parse_mode="Markdown", reply_markup=SERVICES_KB)
@@ -868,6 +1056,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             "_Примеры: Robot S7, Masterplat, Ecoplat, Orbit, Dimac, рычаг, термоусадка..._",
             parse_mode="Markdown", reply_markup=CANCEL_KB)
     elif text == BTN_CALC:
+        db_track(user.id, "calc", "Калькулятор")
         context.user_data["state"] = ST_CALC_PALL
         await update.message.reply_text(
             "💰 *Калькулятор окупаемости*\n\n"
@@ -922,6 +1111,10 @@ async def _finish_request(update, context, comment: str) -> None:
         "Менеджер свяжется с вами в ближайшее время.\n"
         "⏰ Пн–Пт 9:00–18:00  |  📞 +7 (495) 139-30-30",
         parse_mode="Markdown", reply_markup=MAIN_KB)
+
+    # Сохраняем заявку в БД
+    db_save_lead(user, name, phone, subject, comment)
+    db_track(user.id, "lead", subject)
 
     manager_text = (
         "🔔 *НОВАЯ ЗАЯВКА — РОБОМАСТЕР БОТ*\n\n"
@@ -1008,14 +1201,78 @@ async def inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════════════════
+#  📊  КОМАНДЫ МЕНЕДЖЕРА
+# ══════════════════════════════════════════════════════════
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Статистика — только для менеджера."""
+    if update.effective_user.id != MANAGER_ID:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    await update.message.reply_text(db_get_stats(), parse_mode="Markdown")
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запустить рассылку — только для менеджера."""
+    if update.effective_user.id != MANAGER_ID:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    user_ids = db_get_all_user_ids()
+    context.user_data["state"] = ST_BROADCAST
+    await update.message.reply_text(
+        f"📢 *Рассылка*\n\n"
+        f"Всего пользователей: *{len(user_ids)}*\n\n"
+        "Напишите текст сообщения для рассылки.\n"
+        "_Поддерживается Markdown: **жирный**, _курсив_, ссылки_\n\n"
+        "Для отмены нажмите ❌ Отменить",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KB,
+    )
+
+
+async def cmd_leads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Последние 10 заявок — только для менеджера."""
+    if update.effective_user.id != MANAGER_ID:
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    rows = cur.execute("""
+        SELECT name, phone, subject, comment, created_at
+        FROM leads ORDER BY id DESC LIMIT 10
+    """).fetchall()
+    con.close()
+
+    if not rows:
+        await update.message.reply_text("📋 Заявок пока нет.")
+        return
+
+    text = "📋 *Последние заявки:*\n\n"
+    for name, phone, subject, comment, created_at in rows:
+        date = created_at[:16].replace("T", " ")
+        text += (
+            f"👤 *{name}* | 📱 {phone}\n"
+            f"📌 {subject}\n"
+            f"💬 {comment}\n"
+            f"🕐 {date}\n"
+            f"{'─' * 25}\n"
+        )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ══════════════════════════════════════════════════════════
 #  🚀  ЗАПУСК
 # ══════════════════════════════════════════════════════════
 def main() -> None:
+    db_init()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("stats",     cmd_stats))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("leads",     cmd_leads))
     app.add_handler(CallbackQueryHandler(inline_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages))
-    logger.info("✅ Бот Робомастер v5.0 запущен | robomaster.su")
+    logger.info("✅ Бот Робомастер v6.0 запущен | robomaster.su")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
